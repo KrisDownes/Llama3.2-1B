@@ -1,0 +1,167 @@
+#Implentation of https://arxiv.org/pdf/2106.09685
+
+import torch
+import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import Optional, Dict
+import math
+from torch.cuda.amp import autocast, GradScaler
+from llama import xfmr, apply_rotary_emb, rms_norm, feed_forward
+from weights import XfmrWeights, LayerWeights
+from kvcache import KVCache
+
+@dataclass
+class LoRAConfig:
+    r: int = 8  # LoRA rank
+    alpha: int = 16  # LoRA scaling factor
+    dropout: float = 0.05
+    
+class LoRALinearFunction:
+    """LoRA adapter that preserves the original weights"""
+    def __init__(self, weight: torch.Tensor, r: int = 8, alpha: int = 16, dropout: float = 0.05):
+        self.weight = weight  # Original pretrained weight
+        self.rank = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        self.training = False
+        
+        # Initialize LoRA A and B matrices
+        self.lora_A = torch.nn.Parameter(torch.zeros(weight.shape[1], r, device=weight.device))
+        self.lora_B = torch.nn.Parameter(torch.zeros(r, weight.shape[0], device=weight.device))
+        self.dropout = torch.nn.Dropout(p=dropout)
+        
+        # Initialize with scaled random weights
+        torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_B)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # Regular forward pass with original weights
+        base_output = F.linear(x, self.weight)
+        
+        # Add LoRA contribution during training
+        if self.training:
+            lora_output = (self.dropout(x) @ self.lora_A) @ self.lora_B * self.scaling
+            return base_output + lora_output
+        return base_output
+
+    def parameters(self):
+        yield self.lora_A
+        yield self.lora_B
+
+def get_lora_model(xfmr_weights: XfmrWeights, model_params, config: LoRAConfig):
+    """Wraps the original xfmr function with LoRA layers"""
+    
+    # Create LoRA layers for attention weights
+    lora_layers = {}
+    for i in range(model_params.n_layers):
+        layer = xfmr_weights.layer_weights[i]
+        lora_layers[f'layer_{i}_wq'] = LoRALinearFunction(layer.wq, config.r, config.alpha)
+        lora_layers[f'layer_{i}_wk'] = LoRALinearFunction(layer.wk, config.r, config.alpha)
+        lora_layers[f'layer_{i}_wv'] = LoRALinearFunction(layer.wv, config.r, config.alpha)
+        lora_layers[f'layer_{i}_wo'] = LoRALinearFunction(layer.wo, config.r, config.alpha)
+    
+    def lora_attention(x: torch.Tensor, layer_weights: LayerWeights, model_params, cur_pos: int, 
+                      layer_idx: int, freqs_cis: torch.Tensor, kvcache: KVCache, 
+                      attn_mask: Optional[torch.Tensor] = None):
+        """Modified attention function using LoRA layers"""
+        bsz, _, _ = x.shape
+        n_rep = model_params.n_local_heads // model_params.n_local_kv_heads
+
+        # Use LoRA layers instead of original linear layers
+        xq = lora_layers[f'layer_{layer_idx}_wq'](x)
+        xk = lora_layers[f'layer_{layer_idx}_wk'](x)
+        xv = lora_layers[f'layer_{layer_idx}_wv'](x)
+        
+        # Reshape and continue with original attention logic
+        xq = xq.reshape(bsz, -1, model_params.n_local_heads, model_params.head_dim)
+        xk = xk.reshape(bsz, -1, model_params.n_local_kv_heads, model_params.head_dim)
+        xv = xv.reshape(bsz, -1, model_params.n_local_kv_heads, model_params.head_dim)
+        
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        keys, values, kvcache = kvcache.update(xk, xv, layer_idx, cur_pos, n_rep)
+        
+        xq = torch.permute(xq, (0, 2, 1, 3))
+        keys = torch.permute(keys, (0, 2, 3, 1))
+        values = torch.permute(values, (0, 2, 1, 3))
+        
+        scores = torch.matmul(xq.to(torch.bfloat16), keys)
+        scores = scores / math.sqrt(model_params.head_dim)
+        scores = scores.to(torch.float32)
+        
+        if cur_pos == 0:
+            scores = scores + attn_mask
+            
+        scores = F.softmax(scores, dim=-1).to(torch.bfloat16)
+        output = torch.matmul(scores, values)
+        output = output.transpose(1, 2).reshape(bsz, -1, model_params.n_local_heads * model_params.head_dim)
+        
+        output = lora_layers[f'layer_{layer_idx}_wo'](output)
+        return output, kvcache, scores
+    
+    def lora_forward(tokens: torch.Tensor, cur_pos: int, freqs_cis: torch.Tensor, 
+                    kvcache: Optional[KVCache] = None, attn_mask: Optional[torch.Tensor] = None, 
+                    training: bool = False):
+        """Forward pass with LoRA layers"""
+        # Set training mode for all LoRA layers
+        for layer in lora_layers.values():
+            layer.training = training
+            
+        h = xfmr_weights.tok_embeddings[tokens]
+        
+        for i in range(model_params.n_layers):
+            norm_x = rms_norm(h, xfmr_weights.layer_weights[i].attention_norm)
+            h_attn, kvcache, scores = lora_attention(
+                norm_x, xfmr_weights.layer_weights[i], model_params,
+                cur_pos, i, freqs_cis, kvcache, attn_mask
+            )
+            h = h + h_attn
+            h = h + feed_forward(
+                rms_norm(h, xfmr_weights.layer_weights[i].ffn_norm),
+                xfmr_weights.layer_weights[i]
+            )
+            
+        logits = F.linear(rms_norm(h, xfmr_weights.norm), xfmr_weights.output)
+        return logits, kvcache, scores, None
+    
+    def get_lora_state_dict():
+        """Get LoRA weights for saving"""
+        return {name: {'lora_A': layer.lora_A, 'lora_B': layer.lora_B}
+                for name, layer in lora_layers.items()}
+    
+    def load_lora_state_dict(state_dict):
+        """Load saved LoRA weights"""
+        for name, weights in state_dict.items():
+            if name in lora_layers:
+                lora_layers[name].lora_A.data = weights['lora_A']
+                lora_layers[name].lora_B.data = weights['lora_B']
+    
+    def get_parameters():
+        """Get trainable LoRA parameters"""
+        for layer in lora_layers.values():
+            yield from layer.parameters()
+    
+    return lora_forward, get_parameters, get_lora_state_dict, load_lora_state_dict
+
+def setup_training(xfmr_weights, model_params, device="cuda"):
+    """Setup LoRA training"""
+    config = LoRAConfig(r=8, alpha=16, dropout=0.05)
+    
+    lora_forward, get_parameters, get_state_dict, load_state_dict = get_lora_model(
+        xfmr_weights, model_params, config
+    )
+    
+    optimizer = torch.optim.AdamW(
+        get_parameters(),
+        lr=1e-4,
+        weight_decay=0.01
+    )
+    
+    scaler = GradScaler()
+    
+    return {
+        'forward': lora_forward,
+        'optimizer': optimizer,
+        'scaler': scaler,
+        'save_weights': get_state_dict,
+        'load_weights': load_state_dict
+    }
