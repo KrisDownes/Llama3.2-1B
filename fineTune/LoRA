@@ -1,21 +1,100 @@
 #Implentation of https://arxiv.org/pdf/2106.09685
-
+import json
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional, Dict
 import math
+import logging
 from torch.cuda.amp import autocast, GradScaler
 from llama import xfmr, apply_rotary_emb, rms_norm, feed_forward
-from weights import XfmrWeights, LayerWeights
+from weights import XfmrWeights, LayerWeights, load_weights
 from kvcache import KVCache
+from tokenizer import Tokenizer
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
+)
 @dataclass
 class LoRAConfig:
     r: int = 8  # LoRA rank
     alpha: int = 16  # LoRA scaling factor
     dropout: float = 0.05
-    
+
+class CodeDataset(Dataset):
+    def __init__(self, data_path: str, tokenizer, max_length: int = 2048):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.examples = []
+        
+        # Load and process data
+        logging.info(f"Loading dataset from {data_path}")
+        with open(data_path) as f:
+            for line in f:
+                example = json.loads(line)
+                prompt = f"System: {example['system']}\nQuestion: {example['question']}\nResponse: "
+                completion = example['response']
+                
+                # Tokenize
+                full_text = prompt + completion
+                tokens = self.tokenizer.encode(full_text)['input_ids']
+                
+                self.examples.append(tokens)
+        
+        logging.info(f"Loaded {len(self.examples)} examples")
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.examples[idx])
+
+def create_attention_mask(seq_len: int, device: str = "cuda") -> torch.Tensor:
+    """Create causal attention mask"""
+    mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
+    mask = torch.triu(mask, diagonal=1)
+    return mask
+
+class GradientCheckpointFunction(torch.autograd.Function):
+    """Custom checkpointing function for better memory efficiency"""
+    @staticmethod
+    def forward(ctx, run_function, length, *args):
+        ctx.run_function = run_function
+        ctx.save_for_backward(*args)
+        ctx.length = length
+        with torch.no_grad():
+            return run_function(*args)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        if not any(grad_outputs):
+            return (None, None) + tuple(None for _ in range(ctx.length))
+        
+        inputs = ctx.saved_tensors
+        with torch.enable_grad():
+            detached_inputs = [x.detach().requires_grad_() for x in inputs]
+            outputs = ctx.run_function(*detached_inputs)
+            
+        if isinstance(outputs, torch.Tensor):
+            outputs = (outputs,)
+            
+        torch.autograd.backward(
+            outputs,
+            grad_outputs,
+            allow_unused=True
+        )
+        
+        return (None, None) + tuple(inp.grad for inp in detached_inputs)
+
+def checkpoint(function, *args):
+    """Checkpoint wrapper"""
+    return GradientCheckpointFunction.apply(function, len(args), *args)
+
 class LoRALinearFunction:
     """LoRA adapter that preserves the original weights"""
     def __init__(self, weight: torch.Tensor, r: int = 8, alpha: int = 16, dropout: float = 0.05):
@@ -165,3 +244,227 @@ def setup_training(xfmr_weights, model_params, device="cuda"):
         'save_weights': get_state_dict,
         'load_weights': load_state_dict
     }
+
+def train_lora(
+    xfmr_weights,
+    model_params,
+    train_data_path: str,
+    output_dir: str,
+    tokenizer_path: str,
+    device: str = "cuda",
+    batch_size: int = 1,
+    gradient_accumulation_steps: int = 16,  # Increased for smaller batch size
+    num_epochs: int = 3,
+    learning_rate: float = 1e-4,
+    max_grad_norm: float = 1.0,
+    warmup_steps: int = 100,
+    save_steps: int = 1000,
+    max_length: int = 2048,
+    checkpoint_factor: int = 4  # Split sequence into this many chunks for checkpointing
+):
+    """
+    Memory-efficient LoRA training implementation
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Initialize training components
+    train_setup = setup_training(xfmr_weights, model_params, device)
+    lora_forward = train_setup['forward']
+    optimizer = train_setup['optimizer']
+    scaler = train_setup['scaler']
+    
+    # Setup data
+    tokenizer = tokenizer(tokenizer_path)
+    train_dataset = CodeDataset(train_data_path, tokenizer, max_length)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=1,  # Reduced for lower memory usage
+        pin_memory=True
+    )
+    
+    # Precompute rotary embeddings
+    freqs_cis = precompute_freqs_cis(
+        model_params.dim // model_params.n_heads,
+        max_length * 2,
+        device=device
+    )
+    
+    def forward_chunk(chunk_tokens, chunk_pos, chunk_kvcache, chunk_mask):
+        """Wrapper for checkpointed forward pass"""
+        return lora_forward(
+            chunk_tokens,
+            cur_pos=chunk_pos,
+            freqs_cis=freqs_cis[chunk_pos:chunk_pos + chunk_tokens.shape[1]],
+            kvcache=chunk_kvcache,
+            attn_mask=chunk_mask,
+            training=True
+        )[0]  # Only return logits
+    
+    # Training loop
+    global_step = 0
+    optimizer.zero_grad()
+    best_loss = float('inf')
+    
+    for epoch in range(num_epochs):
+        epoch_loss = 0
+        num_batches = 0
+        
+        for batch_idx, tokens in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+            tokens = tokens.to(device)
+            batch_size = tokens.shape[0]
+            seq_len = tokens.shape[1]
+            
+            # Split sequence into chunks for checkpointing
+            chunk_size = seq_len // checkpoint_factor
+            if chunk_size == 0:
+                chunk_size = seq_len
+            
+            accumulated_loss = 0
+            
+            # Process sequence in chunks
+            for chunk_idx in range(0, seq_len, chunk_size):
+                chunk_end = min(chunk_idx + chunk_size, seq_len)
+                chunk_tokens = tokens[:, chunk_idx:chunk_end]
+                
+                # Initialize KV cache for this chunk
+                chunk_kvcache = KVCache(
+                    batch_size=batch_size,
+                    max_seq_len=chunk_size,
+                    n_layers=model_params.n_layers,
+                    n_heads=model_params.n_heads,
+                    head_dim=model_params.head_dim,
+                    device=device
+                )
+                
+                # Create attention mask for chunk
+                chunk_mask = create_attention_mask(chunk_end - chunk_idx, device)
+                
+                # Forward pass with gradient checkpointing and mixed precision
+                with autocast():
+                    # Checkpoint the forward pass
+                    logits = checkpoint(
+                        forward_chunk,
+                        chunk_tokens,
+                        chunk_idx,
+                        chunk_kvcache,
+                        chunk_mask
+                    )
+                    
+                    # Calculate loss for chunk
+                    if chunk_end < seq_len:
+                        target_tokens = tokens[:, chunk_idx+1:chunk_end+1]
+                    else:
+                        target_tokens = tokens[:, chunk_idx+1:chunk_end]
+                        
+                    chunk_loss = F.cross_entropy(
+                        logits[:, :-1].reshape(-1, logits.size(-1)),
+                        target_tokens.reshape(-1),
+                    )
+                    
+                    # Scale loss
+                    chunk_loss = chunk_loss / (gradient_accumulation_steps * checkpoint_factor)
+                    accumulated_loss += chunk_loss.item()
+                
+                # Backward pass with gradient scaling
+                scaler.scale(chunk_loss).backward()
+                
+                # Clear GPU memory
+                del logits, chunk_loss, chunk_kvcache
+                torch.cuda.empty_cache()
+            
+            # Gradient accumulation step
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                # Unscale and clip gradients
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(train_setup['get_parameters'](), max_grad_norm)
+                
+                # Optimizer step
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                
+                # Learning rate warmup
+                if global_step < warmup_steps:
+                    lr = learning_rate * (global_step + 1) / warmup_steps
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = lr
+                
+                # Logging
+                epoch_loss += accumulated_loss
+                num_batches += 1
+                
+                if global_step % 10 == 0:
+                    avg_loss = accumulated_loss * gradient_accumulation_steps
+                    logging.info(
+                        f"Step {global_step}: loss = {avg_loss:.4f}, "
+                        f"lr = {optimizer.param_groups[0]['lr']:.2e}"
+                    )
+                
+                # Save checkpoint
+                if global_step > 0 and global_step % save_steps == 0:
+                    checkpoint_dir = output_dir / f"checkpoint-{global_step}"
+                    checkpoint_dir.mkdir(exist_ok=True)
+                    
+                    avg_loss = epoch_loss / num_batches
+                    if avg_loss < best_loss:
+                        best_loss = avg_loss
+                        is_best = True
+                    else:
+                        is_best = False
+                    
+                    # Save LoRA weights
+                    checkpoint = {
+                        'lora_weights': train_setup['save_weights'](),
+                        'optimizer': optimizer.state_dict(),
+                        'scaler': scaler.state_dict(),
+                        'global_step': global_step,
+                        'epoch': epoch,
+                        'loss': avg_loss
+                    }
+                    
+                    torch.save(checkpoint, checkpoint_dir / "checkpoint.pt")
+                    if is_best:
+                        torch.save(checkpoint, output_dir / "best_model.pt")
+                
+                global_step += 1
+        
+        # End of epoch logging
+        avg_epoch_loss = epoch_loss / num_batches
+        logging.info(f"Epoch {epoch+1} complete. Average loss: {avg_epoch_loss:.4f}")
+    
+    # Save final model
+    torch.save(
+        {
+            'lora_weights': train_setup['save_weights'](),
+            'optimizer': optimizer.state_dict(),
+            'scaler': scaler.state_dict(),
+            'global_step': global_step,
+            'epoch': num_epochs,
+            'loss': avg_epoch_loss
+        },
+        output_dir / "final_model.pt"
+    )
+
+def precompute_freqs_cis(dim: int, end: int, device: str = "cuda") -> torch.Tensor:
+    """Precompute the frequency cis matrix for rotary embeddings."""
+    freqs = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(end, device=device)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
+
+# Example usage
+if __name__ == "__main__":
+    train_lora(
+        xfmr_weights=your_xfmr_weights,
+        model_params=your_model_params,
+        train_data_path="path/to/openorca-slim.jsonl",
+        output_dir="lora_checkpoints",
+        tokenizer_path="path/to/tokenizer",
+        batch_size=1,
+        gradient_accumulation_steps=16,
+        checkpoint_factor=4  # Adjust based on your GPU memory
+    )
