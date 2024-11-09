@@ -506,6 +506,7 @@ def training_step(batch_idx, accumulated_loss, valid_forward_passes, scaler, opt
     """Optimized training step with better gradient handling"""
     if valid_forward_passes > 0 and (batch_idx + 1) % gradient_accumulation_steps == 0:
         try:
+            parameters = list(train_setup['get_parameters']())
             # Log pre-scaling gradients if needed
             if batch_idx == 15:
                 logging.info("Pre-scaling gradient norms:")
@@ -517,8 +518,7 @@ def training_step(batch_idx, accumulated_loss, valid_forward_passes, scaler, opt
             # This is crucial - unscale before clip
             scaler.unscale_(optimizer)
             
-            # Get parameters and check for NaN/inf before clipping
-            parameters = list(train_setup['get_parameters']())
+            #check for NaN/inf before clipping
             has_nan_inf = False
             for p in parameters:
                 if p.grad is not None:
@@ -586,7 +586,7 @@ def training_step(batch_idx, accumulated_loss, valid_forward_passes, scaler, opt
             logging.error(f"Error in optimization step: {str(e)}")
             optimizer.zero_grad(set_to_none=True)
             return global_step
-
+    return global_step
 
 def train_lora(
     xfmr_weights,
