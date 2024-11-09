@@ -436,7 +436,14 @@ def setup_training(xfmr_weights, model_params, device):
         weight_decay=0.01
     )
     
-    scaler = GradScaler(device=device)
+    # Initialize scaler with higher initial scale
+    scaler = GradScaler(
+        init_scale=2**14,
+        growth_factor=2.0,
+        backoff_factor=0.5,
+        growth_interval=2000,
+        enabled=True
+    )
     
     return {
         'forward': lora_forward,
@@ -447,6 +454,7 @@ def setup_training(xfmr_weights, model_params, device):
         'get_parameters': get_parameters,
         'get_named_parameters': get_named_parameters
     }
+
 def forward_chunk(chunk_tokens, chunk_pos, chunk_mask, lora_forward, freqs_cis, model_params, device):
     """Wrapper for checkpointed forward pass with proper gradient handling"""
     chunk_size = chunk_tokens.shape[1]
@@ -493,6 +501,92 @@ def forward_chunk(chunk_tokens, chunk_pos, chunk_mask, lora_forward, freqs_cis, 
     logits = CheckpointFunction.apply(run_forward, chunk_tokens, chunk_freqs, attn_mask)
 
     return logits
+def training_step(batch_idx, accumulated_loss, valid_forward_passes, scaler, optimizer, max_grad_norm, 
+                 train_setup, global_step, warmup_steps, learning_rate, gradient_accumulation_steps):
+    """Optimized training step with better gradient handling"""
+    if valid_forward_passes > 0 and (batch_idx + 1) % gradient_accumulation_steps == 0:
+        try:
+            # Log pre-scaling gradients if needed
+            if batch_idx == 15:
+                logging.info("Pre-scaling gradient norms:")
+                for name, param in train_setup['get_named_parameters']():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        logging.info(f"{name}: {grad_norm}")
+
+            # This is crucial - unscale before clip
+            scaler.unscale_(optimizer)
+            
+            # Get parameters and check for NaN/inf before clipping
+            parameters = list(train_setup['get_parameters']())
+            has_nan_inf = False
+            for p in parameters:
+                if p.grad is not None:
+                    if not torch.isfinite(p.grad).all():
+                        has_nan_inf = True
+                        break
+            
+            if has_nan_inf:
+                logging.warning(f"Found NaN/inf gradients at step {global_step}. Skipping optimization.")
+                optimizer.zero_grad(set_to_none=True)
+                return global_step
+            
+            # Clip gradients
+            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+            
+            # Check if gradients are zero
+            if grad_norm == 0.0:
+                logging.warning(f"Gradient norm is zero at step {global_step}. This might indicate an issue.")
+                optimizer.zero_grad(set_to_none=True)
+                return global_step
+            
+            if torch.isfinite(grad_norm):
+                if batch_idx == 15:
+                    logging.info(f"Grad norm after clipping: {grad_norm}")
+                    for name, param in train_setup['get_named_parameters']():
+                        if param.grad is not None:
+                            grad_max = param.grad.abs().max().item()
+                            grad_mean = param.grad.abs().mean().item()
+                            logging.info(f"{name}: grad_max = {grad_max}, grad_mean = {grad_mean}")
+                
+                # Perform optimization step
+                scale_before = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                scale_after = scaler.get_scale()
+                
+                # Check if scale was reduced (indicating possible inf/nan)
+                if scale_after < scale_before:
+                    logging.warning(f"Gradient scaler reduced scale from {scale_before} to {scale_after}")
+                
+                optimizer.zero_grad(set_to_none=True)
+                
+                # Learning rate warmup
+                if global_step < warmup_steps:
+                    lr = learning_rate * (global_step + 1) / warmup_steps
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = lr
+                
+                if global_step % 10 == 0:
+                    avg_loss = accumulated_loss / (valid_forward_passes * gradient_accumulation_steps)
+                    logging.info(
+                        f"Step {global_step}: loss = {avg_loss:.4f}, "
+                        f"lr = {optimizer.param_groups[0]['lr']:.2e}, "
+                        f"grad_norm = {grad_norm:.2f}, "
+                        f"scaler_scale = {scale_after}"
+                    )
+                
+                return global_step + 1
+            else:
+                logging.warning(f"Skipping step {global_step} due to infinite gradients")
+                optimizer.zero_grad(set_to_none=True)
+                return global_step
+                
+        except RuntimeError as e:
+            logging.error(f"Error in optimization step: {str(e)}")
+            optimizer.zero_grad(set_to_none=True)
+            return global_step
+
 
 def train_lora(
     xfmr_weights,
@@ -520,7 +614,7 @@ def train_lora(
     train_setup = setup_training(xfmr_weights, model_params, device)
     lora_forward = train_setup['forward']
     optimizer = train_setup['optimizer']
-    scaler = GradScaler(enabled=True)
+    scaler = train_setup['scaler']
     
     # Setup data
     tokenizer = Tokenizer(tokenizer_path)
@@ -548,173 +642,157 @@ def train_lora(
         epoch_loss = 0
         num_batches = 0
         
-        for batch_idx, batch in enumerate(tqdm(dataloaders['train'], desc=f"Epoch {epoch+1}/{num_epochs}")):
-            if batch_idx == 15:
-                logging.info(f"Starting processing of batch 15...")
+        for batch_idx, batch in enumerate(tqdm(dataloaders['train'])):
             optimizer.zero_grad(set_to_none=True)
             
             # Move tensors to device
             tokens = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-
-            valid_mask = labels != 128004  # Your padding token ID
-            seq_lengths = valid_mask.sum(dim=1)
-            seq_length = seq_lengths.max().item()
-            if batch_idx == 15:
-                logging.info(f"Actual sequence lengths per item: {seq_lengths.tolist()}")
-                logging.info(f"Max sequence length: {seq_length}")
-                logging.info(f"Valid token positions: {torch.where(valid_mask[0])[0].tolist()}")
-
-            batch_size = tokens.shape[0]
-            #seq_len = tokens.shape[1]
+            
+            # Get proper sequence length
+            valid_mask = labels != 128004  # padding token
+            seq_length = valid_mask.sum(dim=1).max().item()
             chunk_size = max(seq_length // checkpoint_factor, 1)
             
+            if batch_idx == 15:
+                logging.info(f"Total sequence length: {seq_length}")
+                logging.info(f"Chunk size: {chunk_size}")
+                logging.info(f"Number of full chunks: {seq_length // chunk_size}")
+                logging.info(f"Remainder tokens: {seq_length % chunk_size}")
             
             accumulated_loss = 0
             valid_forward_passes = 0
             
-            last_token_pos = (labels != 128004).max(dim=1)[1].item()
-            if batch_idx == 15:
-                logging.info(f"Last non-padding position: {last_token_pos}")
-            # Process sequence in chunks
-            for chunk_idx in range(0, seq_length, chunk_size):
-                chunk_end = min(chunk_idx + chunk_size, seq_length)
+            # Process chunks
+            for chunk_start in range(0, seq_length - chunk_size + 1, chunk_size):
+                chunk_end = chunk_start + chunk_size
                 
-                try:
+                # Extract chunk data
+                chunk_tokens = tokens[:, chunk_start:chunk_end].clone()
+                chunk_attention = attention_mask[:, chunk_start:chunk_end].clone()
+                chunk_labels = labels[:, chunk_start:chunk_end].clone()
+                
+                # Verify chunk has valid tokens
+                chunk_valid = (chunk_labels != 128004).any()
+                if not chunk_valid:
                     if batch_idx == 15:
-                        for name, param in train_setup['get_named_parameters']():
-                            if param.grad is not None:
-                                logging.info(f"Pre-chunk {chunk_idx} {name} grad norm: {param.grad.norm().item()}")
+                        logging.info(f"Skipping chunk {chunk_start}-{chunk_end} - no valid tokens")
+                    continue
+                    
+                try:
                     with autocast(device_type=device, dtype=torch.bfloat16, enabled=True):
-                        # Get chunk tensors
-                        chunk_tokens = tokens[:, chunk_idx:chunk_end].clone()
-                        chunk_attention = attention_mask[:, chunk_idx:chunk_end].clone()
-                        chunk_labels = labels[:, chunk_idx:chunk_end].clone()
-                        valid_tokens = (chunk_labels != 128004).sum().item()
-                        if batch_idx == 15:
-                            logging.info(f"Chunk {chunk_idx} valid tokens: {valid_tokens}")
-                        
-                        if valid_tokens == 0:
-                            if batch_idx == 15:
-                                logging.info(f"Skipping chunk {chunk_idx} - no valid tokens")
-                            continue
-
-                        # Forward pass with fixed gradient handling
                         logits = forward_chunk(
-                            chunk_tokens, 
-                            chunk_idx, 
+                            chunk_tokens,
+                            chunk_start,
                             chunk_attention,
                             lora_forward,
                             freqs_cis,
                             model_params,
                             device
                         )
-                        # Calculate loss
-                        if chunk_end < seq_length:
-                            target_tokens = chunk_labels[:, 1:]
-                            pred_logits = logits[:, :-1]
-                        else:
-                            target_tokens = chunk_labels[:, 1:chunk_end-chunk_idx]
-                            pred_logits = logits[:, :chunk_end-chunk_idx-1]
-                        valid_target_mask = target_tokens != 128004
-                        if batch_idx == 15:
-                            logging.info(f"Chunk {chunk_idx} pred_logits shape: {pred_logits.shape}")
-                            logging.info(f"Chunk {chunk_idx} target_tokens shape: {target_tokens.shape}")
                         
-                        if valid_target_mask.any():
+                        pred_logits = logits[:, :-1, :]
+                        target_tokens = chunk_labels[:, 1:]
+                        
+                        valid_targets = (target_tokens != 128004)
+                        if valid_targets.any():
                             pred_logits = pred_logits.to(torch.float32)
                             pred_logits.requires_grad_(True)
                             chunk_loss = F.cross_entropy(
-                                pred_logits.reshape(-1, pred_logits.size(-1))[valid_target_mask.reshape(-1)],
-                                target_tokens.reshape(-1)[valid_target_mask.reshape(-1)],
+                                pred_logits.reshape(-1, pred_logits.size(-1))[valid_targets.reshape(-1)],
+                                target_tokens.reshape(-1)[valid_targets.reshape(-1)],
                                 reduction='mean'
                             )
-                            if batch_idx == 15:
-                                pred_probs = torch.softmax(pred_logits, dim=-1)
-                                entropy = -(pred_probs * torch.log(pred_probs + 1e-9)).sum(-1).mean()
-                                logging.info(f"Loss: {chunk_loss.item()}")
-                                logging.info(f"Prediction entropy: {entropy.item()}")
+                            
+                            # Scale the loss properly
                             scaled_loss = chunk_loss / (gradient_accumulation_steps * checkpoint_factor)
-                            scaler.scale(scaled_loss).backward(retain_graph=True)
-                            valid_forward_passes += 1
+                            # Make sure to scale the loss before backward
+                            scaler.scale(scaled_loss).backward()
+                            
                             accumulated_loss += chunk_loss.item()
-
-                            if batch_idx == 15:
-                                # Log gradients after backward
-                                for name, param in train_setup['get_named_parameters']():
-                                    if param.grad is not None:
-                                        grad_norm = param.grad.norm().item()
-                                        logging.info(f"Gradient norm for {name}: {grad_norm}")
-                    
+                            valid_forward_passes += 1
+                        
                 except RuntimeError as e:
-                    logging.error(f"Error in chunk {chunk_idx} of batch {batch_idx}: {str(e)}")
-                    if batch_idx == 15:
-                        logging.error(f"Full error traceback: {e.__traceback__}")
+                    logging.error(f"Error processing chunk {chunk_start}-{chunk_end}: {str(e)}")
                     continue
-                
-                # Clear memory
+                    
                 del logits
                 if 'chunk_loss' in locals():
-                    del chunk_loss
-                    del scaled_loss
-                    torch.cuda.empty_cache()
+                    del chunk_loss, scaled_loss
+                torch.cuda.empty_cache()
             
-            # Optimization step
-            if valid_forward_passes > 0 and (batch_idx + 1) % gradient_accumulation_steps == 0:
+            # Process final chunk if needed
+            remainder = seq_length % chunk_size
+            if remainder > 0:
+                chunk_start = seq_length - remainder
                 try:
-                    if batch_idx == 15:
-                        logging.info("Pre-scaling gradient norms:")
-                        for name, param in train_setup['get_named_parameters']():
-                            if param.grad is not None:
-                                grad_norm = param.grad.norm().item()
-                                logging.info(f"{name}: {grad_norm}")
-                    #scaler.unscale_(optimizer)
+                    chunk_tokens = tokens[:, chunk_start:].clone()
+                    chunk_attention = attention_mask[:, chunk_start:].clone()
+                    chunk_labels = labels[:, chunk_start:].clone()
                     
-                    # Clip gradients
-                    parameters = list(train_setup['get_parameters']())
-                    grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
-                    
-                    if torch.isfinite(grad_norm):
-                        if batch_idx == 15:
-                            logging.info(f"Grad norm after clipping: {grad_norm}")
-                            for name, param in train_setup['get_named_parameters']():
-                                if param.grad is not None:
-                                    grad_max = param.grad.abs().max().item()
-                                    grad_mean = param.grad.abs().mean().item()
-                                    logging.info(f"{name}: grad_max = {grad_max}, grad_mean = {grad_mean}")
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        logging.warning(f"Skipping step {global_step} due to infinite gradients")
-                    
-                    optimizer.zero_grad(set_to_none=True)
-                    
-                    # Learning rate warmup
-                    if global_step < warmup_steps:
-                        lr = learning_rate * (global_step + 1) / warmup_steps
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = lr
-                    
-                    if global_step % 10 == 0:
-                        avg_loss = accumulated_loss / (valid_forward_passes * gradient_accumulation_steps)
-                        logging.info(
-                            f"Step {global_step}: loss = {avg_loss:.4f}, "
-                            f"lr = {optimizer.param_groups[0]['lr']:.2e}, "
-                            f"grad_norm = {grad_norm:.2f}"
-                        )
-                    
-                    global_step += 1
-                    
+                    if (chunk_labels != 128004).any():
+                        with autocast(device_type=device, dtype=torch.bfloat16, enabled=True):
+                            logits = forward_chunk(
+                                chunk_tokens,
+                                chunk_start,
+                                chunk_attention,
+                                lora_forward,
+                                freqs_cis,
+                                model_params,
+                                device
+                            )
+                            
+                            pred_logits = logits[:, :-1, :]
+                            target_tokens = chunk_labels[:, 1:]
+                            
+                            valid_targets = (target_tokens != 128004)
+                            if valid_targets.any():
+                                pred_logits = pred_logits.to(torch.float32)
+                                pred_logits.requires_grad_(True)
+                                chunk_loss = F.cross_entropy(
+                                    pred_logits.reshape(-1, pred_logits.size(-1))[valid_targets.reshape(-1)],
+                                    target_tokens.reshape(-1)[valid_targets.reshape(-1)],
+                                    reduction='mean'
+                                )
+                                
+                                scaled_loss = chunk_loss / (gradient_accumulation_steps * checkpoint_factor)
+                                scaler.scale(scaled_loss).backward()
+                                
+                                accumulated_loss += chunk_loss.item()
+                                valid_forward_passes += 1
+                        
+                        del logits
+                        if 'chunk_loss' in locals():
+                            del chunk_loss, scaled_loss
+                        torch.cuda.empty_cache()
+                        
                 except RuntimeError as e:
-                    logging.error(f"Error in optimization step: {str(e)}")
-                    continue
-                
+                    logging.error(f"Error processing final chunk: {str(e)}")
+            
+            # Optimization step using the new training_step function
+            global_step = training_step(
+                batch_idx=batch_idx,
+                accumulated_loss=accumulated_loss,
+                valid_forward_passes=valid_forward_passes,
+                scaler=scaler,
+                optimizer=optimizer,
+                max_grad_norm=max_grad_norm,
+                train_setup=train_setup,
+                global_step=global_step,
+                warmup_steps=warmup_steps,
+                learning_rate=learning_rate,
+                gradient_accumulation_steps=gradient_accumulation_steps
+            )
+            
             # Clear batch tensors
             del tokens, attention_mask, labels
             torch.cuda.empty_cache()
             
-        # End of epoch logging
+            num_batches += 1
+            epoch_loss += accumulated_loss
+        
+        # End of epoch logging and checkpointing
         avg_epoch_loss = epoch_loss / (num_batches + 1e-8)
         logging.info(f"Epoch {epoch+1} complete. Average loss: {avg_epoch_loss:.4f}")
         
@@ -743,7 +821,6 @@ def train_lora(
         },
         output_dir / "final_model.pt"
     )
-
 
 def precompute_freqs_cis(dim: int, end: int, device: str = "cuda") -> torch.Tensor:
     """Precompute the frequency cis matrix for rotary embeddings."""
