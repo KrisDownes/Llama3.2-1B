@@ -276,15 +276,15 @@ class CheckpointFunction(torch.autograd.Function):
 class LoRALinearFunction:
     """LoRA adapter that preserves the original weights"""
     def __init__(self, weight: torch.Tensor, r: int = 8, alpha: int = 16, dropout: float = 0.05):
-        self.weight = weight  # Original pretrained weight
+        self.weight = weight.detach()  # Original pretrained weight
         self.rank = r
         self.alpha = alpha
         self.scaling = alpha / r
-        self.training = False
+        self.training = True
         
         # Initialize LoRA A and B matrices
-        self.lora_A = torch.nn.Parameter(torch.zeros(weight.shape[1], r, device=weight.device))
-        self.lora_B = torch.nn.Parameter(torch.zeros(r, weight.shape[0], device=weight.device))
+        self.lora_A = torch.nn.Parameter(torch.zeros(weight.shape[1], r, device=weight.device, requires_grad=True))
+        self.lora_B = torch.nn.Parameter(torch.zeros(r, weight.shape[0], device=weight.device, requires_grad= True))
         self.dropout = torch.nn.Dropout(p=dropout)
         
         # Initialize with scaled random weights
@@ -297,6 +297,8 @@ class LoRALinearFunction:
         
         # Add LoRA contribution during training
         if self.training:
+            if not x.requires_grad:
+                x = x.detach().requires_grad_(True)
             lora_output = (self.dropout(x) @ self.lora_A) @ self.lora_B * self.scaling
             return base_output + lora_output
         return base_output
@@ -312,10 +314,10 @@ def get_lora_model(xfmr_weights: XfmrWeights, model_params, config: LoRAConfig):
     lora_layers = {}
     for i in range(model_params.n_layers):
         layer = xfmr_weights.layer_weights[i]
-        lora_layers[f'layer_{i}_wq'] = LoRALinearFunction(layer.wq, config.r, config.alpha)
-        lora_layers[f'layer_{i}_wk'] = LoRALinearFunction(layer.wk, config.r, config.alpha)
-        lora_layers[f'layer_{i}_wv'] = LoRALinearFunction(layer.wv, config.r, config.alpha)
-        lora_layers[f'layer_{i}_wo'] = LoRALinearFunction(layer.wo, config.r, config.alpha)
+        lora_layers[f'layer_{i}_wq'] = LoRALinearFunction(layer.wq.clone(), config.r, config.alpha)
+        lora_layers[f'layer_{i}_wk'] = LoRALinearFunction(layer.wk.clone(), config.r, config.alpha)
+        lora_layers[f'layer_{i}_wv'] = LoRALinearFunction(layer.wv.clone(), config.r, config.alpha)
+        lora_layers[f'layer_{i}_wo'] = LoRALinearFunction(layer.wo.clone(), config.r, config.alpha)
     
     def get_named_parameters():
         """Returns iterator of (name, parameter) pairs"""
@@ -335,7 +337,7 @@ def get_lora_model(xfmr_weights: XfmrWeights, model_params, config: LoRAConfig):
         bsz, seqlen, _ = x.shape
         n_rep = model_params.n_local_heads // model_params.n_local_kv_heads
 
-        x = x.detach().requires_grad_()
+        x.requires_grad_(True)
         # Use LoRA layers instead of original linear layers
         xq = lora_layers[f'layer_{layer_idx}_wq'](x)
         xk = lora_layers[f'layer_{layer_idx}_wk'](x)
@@ -351,8 +353,8 @@ def get_lora_model(xfmr_weights: XfmrWeights, model_params, config: LoRAConfig):
         #print(xk.shape,xv.shape,layer_idx,cur_pos,n_rep)
         keys, values, kvcache = kvcache.update(xk, xv, layer_idx, cur_pos, n_rep)
 
-        keys = keys.detach().requires_grad_()
-        values = values.detach().requires_grad_()
+        keys = keys.requires_grad_(True)
+        values = values.requires_grad_(True)
 
 
         xq = xq.transpose(1, 2)  # [bsz, n_heads, seq_len, head_dim]
@@ -376,7 +378,7 @@ def get_lora_model(xfmr_weights: XfmrWeights, model_params, config: LoRAConfig):
     
     def lora_forward(tokens: torch.Tensor, cur_pos: int, freqs_cis: torch.Tensor, 
                     kvcache: Optional[KVCache] = None, attn_mask: Optional[torch.Tensor] = None, 
-                    training: bool = False):
+                    training: bool = True):
         """Forward pass with LoRA layers"""
         # Set training mode for all LoRA layers
         for layer in lora_layers.values():
@@ -385,7 +387,6 @@ def get_lora_model(xfmr_weights: XfmrWeights, model_params, config: LoRAConfig):
         h = xfmr_weights.tok_embeddings[tokens]
         if training:
             h.requires_grad_(True)
-        
         for i in range(model_params.n_layers):
             norm_x = rms_norm(h, xfmr_weights.layer_weights[i].attention_norm)
             h_attn, kvcache, scores = lora_attention(
@@ -399,6 +400,7 @@ def get_lora_model(xfmr_weights: XfmrWeights, model_params, config: LoRAConfig):
             )
             
         logits = F.linear(rms_norm(h, xfmr_weights.norm), xfmr_weights.output)
+        logits.requires_grad_(True)
         return logits, kvcache, scores, None
     
     def get_lora_state_dict():
@@ -445,6 +447,52 @@ def setup_training(xfmr_weights, model_params, device):
         'get_parameters': get_parameters,
         'get_named_parameters': get_named_parameters
     }
+def forward_chunk(chunk_tokens, chunk_pos, chunk_mask, lora_forward, freqs_cis, model_params, device):
+    """Wrapper for checkpointed forward pass with proper gradient handling"""
+    chunk_size = chunk_tokens.shape[1]
+    chunk_kvcache = KVCache(
+        layers=model_params.n_layers,
+        bsz=chunk_tokens.shape[0],
+        max_seq_len=chunk_pos + chunk_size, 
+        kv_heads=model_params.n_local_kv_heads,
+        head_dim=model_params.head_dim
+    )
+    
+    # Ensure tensors are properly cloned and detached
+    #chunk_tokens = chunk_tokens.to(torch.float32)
+    chunk_tokens = chunk_tokens.detach()
+    #chunk_tokens.requires_grad_(True)
+    
+    chunk_freqs = freqs_cis[chunk_pos:chunk_pos + chunk_tokens.shape[1]]
+    #chunk_freqs = chunk_freqs.real.to(torch.float32)
+    #chunk_freqs.requires_grad_(True)
+
+    
+    attn_mask = create_attention_mask(chunk_size, chunk_pos, device=device)
+    #if attn_mask is not None:
+        #attn_mask = attn_mask.to(torch.float32)
+        #attn_mask.requires_grad_(True)
+
+    def run_forward(*args):
+        tokens, freqs, mask = args
+        # Convert tokens back to long for embedding lookup
+        tokens = tokens.to(torch.long)
+        with autocast(device_type=device, dtype=torch.bfloat16, enabled=True):
+            logits, kvcache, scores, _ = lora_forward(
+                tokens,
+                cur_pos=chunk_pos,
+                freqs_cis=freqs,
+                kvcache=chunk_kvcache,
+                attn_mask=mask,
+                training=True
+            )
+        if torch.isnan(logits).any():
+            logging.error(f"NaN detected in logits")
+        return logits
+    
+    logits = CheckpointFunction.apply(run_forward, chunk_tokens, chunk_freqs, attn_mask)
+
+    return logits
 
 def train_lora(
     xfmr_weights,
@@ -454,26 +502,17 @@ def train_lora(
     tokenizer_path: str,
     device: str = "cuda",
     batch_size: int = 1,
-    gradient_accumulation_steps: int = 16,  # Increased for smaller batch size
+    gradient_accumulation_steps: int = 16,
     num_epochs: int = 3,
     learning_rate: float = 1e-4,
     max_grad_norm: float = 1.0,
     warmup_steps: int = 100,
     save_steps: int = 1000,
     max_length: int = 2048,
-    checkpoint_factor: int = 4,# Split sequence into this many chunks for checkpointing
+    checkpoint_factor: int = 4,
     val_split: float = 0.1 
 ):
-    """
-    Memory-efficient LoRA training implementation
-    """
-    def checkpoint(function, *args):
-        """
-        Checkpoint wrapper for memory efficient computation.
-        Moved inside training function for proper scoping.
-        """
-        return CheckpointFunction.apply(function, *args)
-
+    """Memory-efficient LoRA training with fixed gradient handling"""
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     
@@ -481,17 +520,10 @@ def train_lora(
     train_setup = setup_training(xfmr_weights, model_params, device)
     lora_forward = train_setup['forward']
     optimizer = train_setup['optimizer']
-    scaler = train_setup['scaler']
+    scaler = GradScaler(enabled=True)
     
     # Setup data
     tokenizer = Tokenizer(tokenizer_path)
-
-    prompt_template = {
-        "prefix": "",  # Empty prefix since we're using direct instruction format
-        "instruction": "### Instruction:\n{instruction}\n\n",
-        "input": "### Input:\n{input}\n\n",
-        "response": "### Response:\n{response}"
-    }
     dataloaders = create_code_dataloaders(
         train_path=train_data_path,
         val_path=None, 
@@ -499,273 +531,205 @@ def train_lora(
         batch_size=batch_size,
         max_length=max_length,
         num_workers=1,
-        val_split=val_split,
-        prompt_template=prompt_template
+        val_split=val_split
     )
+    
     freqs_cis = precompute_freqs_cis(
         model_params.head_dim,
         max_length * 2,
         device=device
     )
     
-    
-    
-    def forward_chunk(chunk_tokens, chunk_pos, chunk_mask):
-        """Wrapper for checkpointed forward pass"""
-        chunk_size = chunk_tokens.shape[1]
-        chunk_kvcache = KVCache(
-            layers=model_params.n_layers,
-            bsz=chunk_tokens.shape[0],
-            max_seq_len=chunk_pos + chunk_size, 
-            kv_heads=model_params.n_local_kv_heads,
-            head_dim=model_params.head_dim
-        )
-         
-        attn_mask = create_attention_mask(chunk_size, chunk_pos, device=chunk_tokens.device)
-        def _forward():
-            with torch.set_grad_enabled(True):
-                logits, _, _, _ = lora_forward(
-                    chunk_tokens,
-                    cur_pos=chunk_pos,
-                    freqs_cis=freqs_cis[chunk_pos:chunk_pos + chunk_tokens.shape[1]],
-                    kvcache=chunk_kvcache,
-                    attn_mask=attn_mask,
-                    training=True
-                )
-            return logits
-        return checkpoint(_forward)    
     # Training loop
     global_step = 0
-    optimizer.zero_grad(set_to_none = True)
-    best_loss = float('inf')
-
-    # Add debug logging
-    logging.info("Initializing training loop with settings:")
-    logging.info(f"Device: {device}")
-    logging.info(f"Gradient accumulation steps: {gradient_accumulation_steps}")
-    logging.info(f"Checkpoint factor: {checkpoint_factor}")
-    logging.info(f"Mixed precision enabled: {True}")
-
-    # Verify optimizer setup
-    logging.info(f"Optimizer type: {type(optimizer)}")
-    logging.info(f"Number of parameter groups: {len(optimizer.param_groups)}")
-
-    # Initialize grad scaler state explicitly
-    scaler_state = scaler.state_dict()
-    logging.info(f"Initial scaler state: {scaler_state}")
-
-    # Ensure all LoRA parameters require gradients
-    for param in train_setup['get_parameters']():
-        param.requires_grad = True
+    optimizer.zero_grad(set_to_none=True)
     
     for epoch in range(num_epochs):
         epoch_loss = 0
         num_batches = 0
         
         for batch_idx, batch in enumerate(tqdm(dataloaders['train'], desc=f"Epoch {epoch+1}/{num_epochs}")):
-
+            if batch_idx == 15:
+                logging.info(f"Starting processing of batch 15...")
             optimizer.zero_grad(set_to_none=True)
-
+            
+            # Move tensors to device
             tokens = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-            
+
+            valid_mask = labels != 128004  # Your padding token ID
+            seq_lengths = valid_mask.sum(dim=1)
+            seq_length = seq_lengths.max().item()
+            if batch_idx == 15:
+                logging.info(f"Actual sequence lengths per item: {seq_lengths.tolist()}")
+                logging.info(f"Max sequence length: {seq_length}")
+                logging.info(f"Valid token positions: {torch.where(valid_mask[0])[0].tolist()}")
+
             batch_size = tokens.shape[0]
-            seq_len = tokens.shape[1]
+            #seq_len = tokens.shape[1]
+            chunk_size = max(seq_length // checkpoint_factor, 1)
             
-            # Split sequence into chunks for checkpointing
-            chunk_size = max(seq_len // checkpoint_factor, 1)
             
             accumulated_loss = 0
             valid_forward_passes = 0
             
+            last_token_pos = (labels != 128004).max(dim=1)[1].item()
+            if batch_idx == 15:
+                logging.info(f"Last non-padding position: {last_token_pos}")
             # Process sequence in chunks
-            for chunk_idx in range(0, seq_len, chunk_size):
-                chunk_end = min(chunk_idx + chunk_size, seq_len)
-                chunk_tokens = tokens[:, chunk_idx:chunk_end]
-                chunk_attention = attention_mask[:, chunk_idx:chunk_end]
-                chunk_labels = labels[:, chunk_idx:chunk_end]
-                # Create attention mask for chunk
-                chunk_mask = create_attention_mask(chunk_end - chunk_idx, chunk_idx, device)
+            for chunk_idx in range(0, seq_length, chunk_size):
+                chunk_end = min(chunk_idx + chunk_size, seq_length)
                 
                 try:
-                    with autocast(device_type=device, enabled=True):
-
-                        logits = forward_chunk(chunk_tokens, chunk_idx, chunk_mask)
-                        if not logits.requires_grad:
-                            logging.warning(f"Logits missing gradient at chunk {chunk_idx}")
-                            continue
+                    if batch_idx == 15:
+                        for name, param in train_setup['get_named_parameters']():
+                            if param.grad is not None:
+                                logging.info(f"Pre-chunk {chunk_idx} {name} grad norm: {param.grad.norm().item()}")
+                    with autocast(device_type=device, dtype=torch.bfloat16, enabled=True):
+                        # Get chunk tensors
+                        chunk_tokens = tokens[:, chunk_idx:chunk_end].clone()
+                        chunk_attention = attention_mask[:, chunk_idx:chunk_end].clone()
+                        chunk_labels = labels[:, chunk_idx:chunk_end].clone()
+                        valid_tokens = (chunk_labels != 128004).sum().item()
+                        if batch_idx == 15:
+                            logging.info(f"Chunk {chunk_idx} valid tokens: {valid_tokens}")
                         
-                        if chunk_end < seq_len:
+                        if valid_tokens == 0:
+                            if batch_idx == 15:
+                                logging.info(f"Skipping chunk {chunk_idx} - no valid tokens")
+                            continue
+
+                        # Forward pass with fixed gradient handling
+                        logits = forward_chunk(
+                            chunk_tokens, 
+                            chunk_idx, 
+                            chunk_attention,
+                            lora_forward,
+                            freqs_cis,
+                            model_params,
+                            device
+                        )
+                        # Calculate loss
+                        if chunk_end < seq_length:
                             target_tokens = chunk_labels[:, 1:]
                             pred_logits = logits[:, :-1]
                         else:
                             target_tokens = chunk_labels[:, 1:chunk_end-chunk_idx]
                             pred_logits = logits[:, :chunk_end-chunk_idx-1]
+                        valid_target_mask = target_tokens != 128004
+                        if batch_idx == 15:
+                            logging.info(f"Chunk {chunk_idx} pred_logits shape: {pred_logits.shape}")
+                            logging.info(f"Chunk {chunk_idx} target_tokens shape: {target_tokens.shape}")
                         
-                        # Verify shapes before loss calculation
-                        logging.debug(f"Pred logits shape: {pred_logits.shape}")
-                        logging.debug(f"Target tokens shape: {target_tokens.shape}")
-                        
-
-
-                        if pred_logits.shape[:-1] != target_tokens.shape:
-                            logging.error(f"Shape mismatch: pred_logits {pred_logits.shape}, targets {target_tokens.shape}")
-                            continue
-                        if not pred_logits.requires_grad:
-                            logging.warning("Pred logits doesn't require grad, enabling...")
+                        if valid_target_mask.any():
+                            pred_logits = pred_logits.to(torch.float32)
                             pred_logits.requires_grad_(True)
-                        
-                        chunk_loss = F.cross_entropy(
-                            pred_logits.reshape(-1, pred_logits.size(-1)),
-                            target_tokens.reshape(-1),
-                            ignore_index=tokenizer.pad_id
-                        )
-                        
-                        scaled_loss = chunk_loss / (gradient_accumulation_steps * checkpoint_factor)
-                        scaler.scale(scaled_loss).backward()
-                        
-                        # Verify loss values
-                        if not torch.isfinite(chunk_loss):
-                            logging.error(f"Non-finite loss detected: {chunk_loss.item()}")
-                            continue
-                            
-                        logging.debug(f"Chunk loss: {chunk_loss.item()}, Scaled loss: {scaled_loss.item()}")
-                    
-                    # Scale and backward
-                    scaler.scale(scaled_loss).backward()
-                    valid_forward_passes += 1
-                    accumulated_loss += chunk_loss.item()
+                            chunk_loss = F.cross_entropy(
+                                pred_logits.reshape(-1, pred_logits.size(-1))[valid_target_mask.reshape(-1)],
+                                target_tokens.reshape(-1)[valid_target_mask.reshape(-1)],
+                                reduction='mean'
+                            )
+                            if batch_idx == 15:
+                                pred_probs = torch.softmax(pred_logits, dim=-1)
+                                entropy = -(pred_probs * torch.log(pred_probs + 1e-9)).sum(-1).mean()
+                                logging.info(f"Loss: {chunk_loss.item()}")
+                                logging.info(f"Prediction entropy: {entropy.item()}")
+                            scaled_loss = chunk_loss / (gradient_accumulation_steps * checkpoint_factor)
+                            scaler.scale(scaled_loss).backward(retain_graph=True)
+                            valid_forward_passes += 1
+                            accumulated_loss += chunk_loss.item()
+
+                            if batch_idx == 15:
+                                # Log gradients after backward
+                                for name, param in train_setup['get_named_parameters']():
+                                    if param.grad is not None:
+                                        grad_norm = param.grad.norm().item()
+                                        logging.info(f"Gradient norm for {name}: {grad_norm}")
                     
                 except RuntimeError as e:
-                    logging.error(f"Error in forward/backward pass: {str(e)}")
+                    logging.error(f"Error in chunk {chunk_idx} of batch {batch_idx}: {str(e)}")
+                    if batch_idx == 15:
+                        logging.error(f"Full error traceback: {e.__traceback__}")
                     continue
                 
-                del logits, chunk_loss
-                torch.cuda.empty_cache()
+                # Clear memory
+                del logits
+                if 'chunk_loss' in locals():
+                    del chunk_loss
+                    del scaled_loss
+                    torch.cuda.empty_cache()
             
-            # Gradient accumulation step
+            # Optimization step
             if valid_forward_passes > 0 and (batch_idx + 1) % gradient_accumulation_steps == 0:
                 try:
-                    # Check gradient norms before unscaling
-                    grad_norms_before = {}
-                    for name, param in train_setup['get_named_parameters']():
-                        if param.grad is not None:
-                            grad_norms_before[name] = param.grad.norm().item()
-                    logging.debug(f"Gradient norms before unscaling: {grad_norms_before}")
+                    if batch_idx == 15:
+                        logging.info("Pre-scaling gradient norms:")
+                        for name, param in train_setup['get_named_parameters']():
+                            if param.grad is not None:
+                                grad_norm = param.grad.norm().item()
+                                logging.info(f"{name}: {grad_norm}")
+                    #scaler.unscale_(optimizer)
                     
-                    # Unscale gradients
-                    scaler.unscale_(optimizer)
-                    
-                    # Check gradient norms after unscaling
-                    grad_norms_after = {}
-                    for name, param in train_setup['get_named_parameters']():
-                        if param.grad is not None:
-                            grad_norms_after[name] = param.grad.norm().item()
-                    logging.debug(f"Gradient norms after unscaling: {grad_norms_after}")
-
-                    # Get all parameters as a list for gradient clipping
-                    parameters = list(train_setup['get_parameters']())
                     # Clip gradients
+                    parameters = list(train_setup['get_parameters']())
                     grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+                    
                     if torch.isfinite(grad_norm):
+                        if batch_idx == 15:
+                            logging.info(f"Grad norm after clipping: {grad_norm}")
+                            for name, param in train_setup['get_named_parameters']():
+                                if param.grad is not None:
+                                    grad_max = param.grad.abs().max().item()
+                                    grad_mean = param.grad.abs().mean().item()
+                                    logging.info(f"{name}: grad_max = {grad_max}, grad_mean = {grad_mean}")
                         scaler.step(optimizer)
                         scaler.update()
-                        logging.debug(f"Successfully completed optimizer step {global_step}")
                     else:
                         logging.warning(f"Skipping step {global_step} due to infinite gradients")
                     
                     optimizer.zero_grad(set_to_none=True)
-                except RuntimeError as e:
-                    logging.error(f"Error in optimization step: {str(e)}")
-                    continue
-                if batch_idx == 14:  # The batch before the error occurs
-                    logging.info("Detailed state at batch 14:")
-                    logging.info(f"Scaler state: {scaler.state_dict()}")
-                    logging.info(f"Optimizer state keys: {optimizer.state_dict().keys()}")
-                    logging.info(f"Valid forward passes: {valid_forward_passes}")
-                    logging.info(f"Accumulated loss: {accumulated_loss}")
-                # Learning rate warmup
-                if global_step < warmup_steps:
+                    
+                    # Learning rate warmup
+                    if global_step < warmup_steps:
                         lr = learning_rate * (global_step + 1) / warmup_steps
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = lr
                     
-                epoch_loss += accumulated_loss
-                num_batches += 1
-                
-                if global_step % 10 == 0:
-                        avg_loss = accumulated_loss / gradient_accumulation_steps
+                    if global_step % 10 == 0:
+                        avg_loss = accumulated_loss / (valid_forward_passes * gradient_accumulation_steps)
                         logging.info(
                             f"Step {global_step}: loss = {avg_loss:.4f}, "
                             f"lr = {optimizer.param_groups[0]['lr']:.2e}, "
                             f"grad_norm = {grad_norm:.2f}"
                         )
                     
-                global_step += 1
-
-                # Validation phase
-                if global_step > 0 and global_step % save_steps == 0:
-                    model_val_loss = 0
-                    num_val_batches = 0
+                    global_step += 1
                     
-                    # Switch to evaluation mode
-                    for layer in train_setup['get_parameters']():
-                        layer.training = False
-                    
-                    with torch.no_grad():
-                        for val_batch in dataloaders['val']:
-                            val_tokens = val_batch['input_ids'].to(device)
-                            val_attention = val_batch['attention_mask'].to(device)
-                            val_labels = val_batch['labels'].to(device)
-                            
-                            # Simple forward pass for validation (no chunking needed)
-                            with autocast(device_type=device):
-                                val_logits = lora_forward(
-                                    val_tokens,
-                                    cur_pos=0,
-                                    freqs_cis=freqs_cis[:val_tokens.shape[1]],
-                                    attn_mask=create_attention_mask(val_tokens.shape[1], 0, device),
-                                    training=False
-                                )[0]
-                                
-                                val_loss = F.cross_entropy(
-                                    val_logits[:, :-1].reshape(-1, val_logits.size(-1)),
-                                    val_labels[:, 1:].reshape(-1),
-                                    ignore_index=tokenizer.pad_id
-                                )
-                            
-                            model_val_loss += val_loss.item()
-                            num_val_batches += 1
-                # Switch back to training mode
-                    for layer in train_setup['get_parameters']():
-                        layer.training = True
-                # Calculate average validation loss
-                    avg_val_loss = model_val_loss / num_val_batches
-
-                if avg_val_loss < best_loss:
-                        best_loss = avg_val_loss
-                        is_best = True
-
-                        # Save best model
-                        checkpoint = {
-                            'lora_weights': train_setup['save_weights'](),
-                            'optimizer': optimizer.state_dict(),
-                            'scaler': scaler.state_dict(),
-                            'global_step': global_step,
-                            'epoch': epoch,
-                            'train_loss': avg_loss,
-                            'val_loss': avg_val_loss
-                        }
-                        
-                        torch.save(checkpoint, output_dir / "best_model.pt")
-                        logging.info(f"Saved new best model with validation loss: {avg_val_loss:.4f}")
+                except RuntimeError as e:
+                    logging.error(f"Error in optimization step: {str(e)}")
+                    continue
                 
-                global_step += 1
+            # Clear batch tensors
+            del tokens, attention_mask, labels
+            torch.cuda.empty_cache()
+            
         # End of epoch logging
-        avg_epoch_loss = epoch_loss / num_batches
+        avg_epoch_loss = epoch_loss / (num_batches + 1e-8)
         logging.info(f"Epoch {epoch+1} complete. Average loss: {avg_epoch_loss:.4f}")
-
+        
+        # Save checkpoint
+        torch.save(
+            {
+                'lora_weights': train_setup['save_weights'](),
+                'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
+                'global_step': global_step,
+                'epoch': epoch,
+                'loss': avg_epoch_loss
+            },
+            output_dir / f"checkpoint_epoch_{epoch+1}.pt"
+        )
     
     # Save final model
     torch.save(
