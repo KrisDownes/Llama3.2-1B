@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict,NamedTuple
 import math
 import json
 import logging
@@ -11,16 +11,68 @@ import random
 from tqdm import tqdm
 import gc
 from llama import attention, apply_rotary_emb, rms_norm, feed_forward,LLAMA_1B_PARAMS
-from weights import XfmrWeights, LayerWeights, load_weights
 from kvcache import KVCache
 from tokenizer import Tokenizer
+from kvcache import KVCache
 
+
+if torch.cuda.is_available():
+  device = torch.device("cuda")
+else:
+  device = torch.device("cpu")
+
+print(f"Using Device {device}")
 @dataclass
 class LoRAConfig:
     r: int = 8
     alpha: float = 16
     dropout: float = 0.05
     target_modules: tuple = ("wq", "wk", "wv", "wo")
+
+@dataclass
+class LayerWeights(NamedTuple):
+    wq: torch.tensor
+    wk: torch.tensor
+    wv: torch.tensor
+    wo: torch.tensor
+    w1: torch.tensor
+    w2: torch.tensor
+    w3: torch.tensor
+    ffn_norm: torch.tensor
+    attention_norm: torch.tensor
+
+class XfmrWeights(NamedTuple):
+    tok_embeddings: torch.tensor
+    norm: torch.tensor
+    output: torch.tensor
+    layer_weights: List[LayerWeights]
+
+def load_weights(ckpt_path: Path = Path('checkpoints\Llama3.2-1B-Instruct\consolidated.00.pth'), n_layers: int = 16):
+        # Load the entire state dict
+        state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)        
+        layer_weights = []
+        for i in range(n_layers):
+            layer_weights.append(LayerWeights(
+                wq=state_dict[f'layers.{i}.attention.wq.weight'].to(torch.bfloat16),
+                wk=state_dict[f'layers.{i}.attention.wk.weight'].to(torch.bfloat16),
+                wv=state_dict[f'layers.{i}.attention.wv.weight'].to(torch.bfloat16),
+                wo=state_dict[f'layers.{i}.attention.wo.weight'].to(torch.bfloat16),
+                w1=state_dict[f'layers.{i}.feed_forward.w1.weight'].to(torch.bfloat16),
+                w2=state_dict[f'layers.{i}.feed_forward.w2.weight'].to(torch.bfloat16),
+                w3=state_dict[f'layers.{i}.feed_forward.w3.weight'].to(torch.bfloat16),
+                ffn_norm=state_dict[f'layers.{i}.ffn_norm.weight'].to(torch.bfloat16),
+                attention_norm=state_dict[f'layers.{i}.attention_norm.weight'].to(torch.bfloat16),
+            ))
+        
+        xfmr_weights = XfmrWeights(
+            tok_embeddings=state_dict['tok_embeddings.weight'].to(torch.bfloat16),
+            norm=state_dict['norm.weight'].to(torch.bfloat16),
+            output=state_dict['output.weight'].to(torch.bfloat16),
+            layer_weights=layer_weights
+        )
+        
+        return xfmr_weights
+
 
 def apply_scaling(freqs: torch.Tensor) -> torch.Tensor:
     """
@@ -86,18 +138,23 @@ def build_attn_mask(seqlen: int, start_pos: int, device: str = "cuda") -> torch.
 class LoRALinear(nn.Module):
     def __init__(self, base_weight: torch.Tensor, config: LoRAConfig):
         super().__init__()
-        self.base_weight = base_weight.detach()  # Freeze base weights
+        self.base_weight = nn.Parameter(base_weight, requires_grad=False)  # Freeze base weights
         self.rank = config.r
         self.scaling = config.alpha / config.r
         
         # Initialize LoRA matrices
-        self.lora_A = nn.Parameter(torch.zeros(config.r, base_weight.shape[1]))
-        self.lora_B = nn.Parameter(torch.zeros(base_weight.shape[0], config.r))
+        in_features = base_weight.shape[1]
+        out_features = base_weight.shape[0]
+        self.lora_A = nn.Parameter(torch.zeros(self.rank, in_features), requires_grad=True)
+        self.lora_B = nn.Parameter(torch.zeros(out_features, self.rank), requires_grad=True)
         self.dropout = nn.Dropout(p=config.dropout)
         
         # Initialize weights
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
+
+        self.lora_A.requires_grad_(True)
+        self.lora_B.requires_grad_(True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = F.linear(x, self.base_weight)
@@ -105,12 +162,43 @@ class LoRALinear(nn.Module):
             lora_out = self.dropout(x) @ self.lora_A.T @ self.lora_B.T
             return base_out + (lora_out * self.scaling)
         return base_out
+    def get_effective_weight(self) -> torch.Tensor:
+        """Compute the effective weight matrix including LoRA adaptation"""
+        if self.rank > 0:
+            return self.base_weight + (self.lora_B @ self.lora_A * self.scaling)
+        return self.base_weight
+    
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        """Make LoRALinear compatible with torch functions"""
+        if kwargs is None:
+            kwargs = {}
+            
+        if func is F.linear:
+            # For F.linear, replace self with effective weight
+            new_args = list(args)
+            idx = new_args.index(self)
+            new_args[idx] = self.get_effective_weight()
+            return func(*new_args, **kwargs)
+            
+        return NotImplemented
+    
+    @property
+    def shape(self):
+        """Return shape of effective weight matrix"""
+        return self.base_weight.shape
+    
+    def to(self, *args, **kwargs):
+        """Ensure proper device movement"""
+        super().to(*args, **kwargs)
+        self.base_weight = self.base_weight.to(*args, **kwargs)
+        return self
+
 
 class LoRALayerWeights(nn.Module):
     def __init__(self, base_layer, config: LoRAConfig):
         super().__init__()
-        self.attention_norm = base_layer.attention_norm
-        self.ffn_norm = base_layer.ffn_norm
+        self.attention_norm = nn.Parameter(base_layer.attention_norm, requires_grad=False)
+        self.ffn_norm = nn.Parameter(base_layer.ffn_norm, requires_grad=False)
         
         self.wq = LoRALinear(base_layer.wq, config) if "wq" in config.target_modules else base_layer.wq
         self.wk = LoRALinear(base_layer.wk, config) if "wk" in config.target_modules else base_layer.wk
@@ -118,9 +206,9 @@ class LoRALayerWeights(nn.Module):
         self.wo = LoRALinear(base_layer.wo, config) if "wo" in config.target_modules else base_layer.wo
         
         # FFN weights - detach to prevent gradient updates
-        self.w1 = base_layer.w1.detach() if isinstance(base_layer.w1, torch.Tensor) else base_layer.w1
-        self.w2 = base_layer.w2.detach() if isinstance(base_layer.w2, torch.Tensor) else base_layer.w2
-        self.w3 = base_layer.w3.detach() if isinstance(base_layer.w3, torch.Tensor) else base_layer.w3
+        self.w1 = nn.Parameter(base_layer.w1, requires_grad=False)
+        self.w2 = nn.Parameter(base_layer.w2, requires_grad=False)
+        self.w3 = nn.Parameter(base_layer.w3, requires_grad=False)
 
     def requires_grad_(self, requires_grad: bool = True):
         """Override requires_grad to only affect LoRA parameters"""
@@ -169,6 +257,17 @@ class LoRAModel(nn.Module):
         self.rms_norm_fn = rms_norm
 
         self._gradient_checkpointing = False
+        self.n_layers = len(self.layers)
+
+    def _initialize_kvcache(self, batch_size: int, max_seq_len: int, model_params) -> KVCache:
+        """Initialize KVCache with proper dimensions"""
+        return KVCache.new(
+            layers=self.n_layers,
+            bsz=batch_size,
+            max_seq_len=max_seq_len,
+            kv_heads=model_params.n_local_kv_heads,
+            head_dim=model_params.head_dim
+        ) 
     
     def gradient_checkpointing_enable(self):
         """Enables gradient checkpointing for memory efficiency"""
@@ -183,15 +282,25 @@ class LoRAModel(nn.Module):
         """Forward pass for a single layer with gradient checkpointing"""
         def create_custom_forward(module):
             def custom_forward(*args):
+                print("In Custom forward.")
                 norm_x = self.rms_norm_fn(args[0], module.attention_norm)
+                print(module)
+                if kvcache is None:
+                    batch_size = args[0].size(0)
+                    seq_len = args[0].size(1)
+                    current_kvcache = self._initialize_kvcache(batch_size, seq_len, model_params)
+                else:
+                    current_kvcache = kvcache
                 h_attn, kv, scores = self.attention_fn(
                     norm_x, module, model_params, cur_pos, layer_idx, 
-                    freqs_cis, kvcache, attn_mask
+                    freqs_cis, current_kvcache, attn_mask
                 )
                 out = args[0] + h_attn
                 out = out + self.feed_forward_fn(
                     self.rms_norm_fn(out, module.ffn_norm), module
                 )
+                print("End of custom forward")
+                print(f"out grad: {out.requires_grad} scores grad: {scores.requires_grad}")
                 return out, kv, scores
             return custom_forward
 
@@ -203,6 +312,10 @@ class LoRAModel(nn.Module):
             )
         else:
             norm_x = self.rms_norm_fn(h, layer.attention_norm)
+            if kvcache is None:
+                batch_size = h.size(0)
+                seq_len = h.size(1)
+                kvcache = self._initialize_kvcache(batch_size, seq_len, model_params)
             h_attn, kv, scores = self.attention_fn(
                 norm_x, layer, model_params, cur_pos, layer_idx, 
                 freqs_cis, kvcache, attn_mask
@@ -231,13 +344,18 @@ class LoRAModel(nn.Module):
             
         h = self.tok_embeddings[tokens]
 
+        if kvcache is None:
+            batch_size = tokens.size(0)
+            seq_len = tokens.size(1)
+            kvcache = self._initialize_kvcache(batch_size, seq_len, model_params)
+
         new_kvcache = []
         all_scores = []
         
         for i, layer in enumerate(self.layers):
             h, kv, scores = self._forward_with_checkpointing(
                 h, layer, model_params, cur_pos, i, freqs_cis, 
-                kvcache[i] if kvcache else None, attn_mask
+                kvcache if kvcache else None, attn_mask
             )
             new_kvcache.append(kv)
             all_scores.append(scores)
@@ -461,32 +579,39 @@ class MemoryEfficientTrainer:
                 if i % 10 == 0:
                     torch.cuda.empty_cache()
                     gc.collect()
-        
         return total_loss / num_batches
     
     @torch.amp.autocast(device_type="cuda")  # Mixed precision for memory efficiency
     def train_step(self, batch, model_params):
+        print("In training step function: ")
         input_ids = batch['input_ids'].to(self.device)
         attention_mask = batch['attention_mask'].to(self.device)
         labels = batch['labels'].to(self.device)
-        
         # Forward pass
+        print("Before forward pass:")
         logits, _, _, _ = self.model(
             tokens=input_ids,
             model_params=model_params,
             cur_pos=0,
             freqs_cis=None  # Will be computed in forward
         )
-        
+        print(f"Logits grad: {logits.requires_grad}")
         # Calculate loss
         loss = self.loss_fn(
             logits.view(-1, logits.size(-1)),
             labels.view(-1)
         )
+        print(f"Loss grad: {loss.requires_grad}")
         scaled_loss = loss / self.grad_accum_steps
-        
+        print(f"scaled loss grad: {scaled_loss.requires_grad}")
         # Backward pass
         scaled_loss.backward()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if param.grad is None:
+                    print(f"No gradient for {name}")
+                else:
+                    print(f"Gradient norm for {name}: {param.grad.norm()}")
         
         # Step optimizer
         if (self.optimizer.state['step'] + 1) % self.grad_accum_steps == 0:
@@ -534,6 +659,14 @@ def train_model(
 ):
     # Initialize model
     model = LoRAModel(base_weights, config).to(device)
+    for layer in model.layers:
+        layer.requires_grad_(True)
+    model.train()
+    # Verify trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(f"Number of trainable parameters: {sum(p.numel() for p in trainable_params)}")
+    if len(trainable_params) == 0:
+        raise ValueError("No trainable parameters found!")
     
     # Initialize trainer
     trainer = MemoryEfficientTrainer(
